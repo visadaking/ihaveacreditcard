@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""Decode 128-byte title entries extracted from a 3DS SD title database.
+"""decode 128-byte title entries extracted from a 3ds sd title database.
 
-The SD card's ``Nintendo 3DS/<id0>/<id1>/dbs/title.db`` lists every
-SD-installed title, one 128-byte "title info entry" per title. save3ds can
+the sd card's ``Nintendo 3DS/<id0>/<id1>/dbs/title.db`` lists every
+sd-installed title, one 128-byte "title info entry" per title. save3ds can
 extract those entries for inspection (each output file is one entry, named
-after the title ID):
+after the title id):
 
-    save3ds_fuse --db sdtitle -x /tmp/dbcheck \\
-        -m ~/3ds/movable.sed -b ~/3ds/boot9.bin "$SD"
+    save3ds_fuse --db sdtitle -x --sd "$SD" \\
+        -m ~/3ds/movable.sed -b ~/3ds/boot9.bin /tmp/dbcheck
 
-Then run this script:
+then run this script:
 
     inspect_title_db.py /tmp/dbcheck                  # every entry
     inspect_title_db.py /tmp/dbcheck 0004000000125500 # one specific title
 
-Field notes (reverse-engineered by cross-referencing pyctr's title database
+field notes (reverse-engineered by cross-referencing pyctr's title database
 code and comparing entries of known-good vs. misbehaving installs):
 
 - ``size_on_sd`` should grow with the game's content size (plus save space),
-- ``flags0`` bit ``0x1`` was set exactly on titles that ship a *manual* CFA
-  (useful as a cross-check only),
+- ``flags0`` bit ``0x1`` was set exactly on the titles that ship a *manual*
+  cfa (cross-check only),
 - ``extdata_id_low`` being non-zero means the game expects system extdata.
 
-Treat it as a verification aid, not a complete schema.
+treat it as a verification aid, not a complete schema.
 """
 
 from __future__ import annotations
@@ -36,35 +36,61 @@ import sys
 _ENTRY = struct.Struct("<QIHHIIIIIIQ")
 
 
+def decode_entry(entry: bytes) -> dict:
+    """decode one 128-byte title info entry into a plain-fields dict."""
+    if len(entry) != 128:
+        raise ValueError(f"unexpected size {len(entry)} (expected 128)")
+    (size, itype, version, ncchver, flags0, tmdid, cmdid, flags1,
+     extdataid_low, reserved, flags2) = _ENTRY.unpack_from(entry, 0)
+    return {
+        "size_on_sd": size,
+        "type": itype,
+        "version": version,
+        "ncch_version": ncchver,
+        "flags0": flags0,
+        "tmd_content_id": tmdid,
+        "cmd_content_id": cmdid,
+        "flags1": flags1,
+        "extdata_id_low": extdataid_low,
+        "reserved2": reserved,
+        "flags2": flags2,
+        "code_text": entry[0x30:0x40].rstrip(b"\0").decode("ascii", "replace"),
+        "extra": struct.unpack_from("<I", entry, 0x50)[0],
+        "tail_all_zero": entry[0x54:] == bytes(128 - 0x54),
+    }
+
+
+def entry_lines(tid: str, d: dict) -> list[str]:
+    lines = [
+        f"{tid}:",
+        f"  size_on_sd     : {d['size_on_sd']:#x} ({d['size_on_sd']} bytes)",
+        f"  type           : {d['type']:#x}",
+        f"  version        : {d['version']:#06x}",
+        f"  ncch_version   : {d['ncch_version']}",
+        f"  flags0         : {d['flags0']:#x}  (bit 0x1: manual cfa present, hint)",
+        f"  tmd_content_id : {d['tmd_content_id']:#x}",
+        f"  cmd_content_id : {d['cmd_content_id']:#x}",
+        f"  flags1         : {d['flags1']:#x}",
+        f"  extdata_id_low : {d['extdata_id_low']:#010x}",
+        f"  reserved2      : {d['reserved2']:#010x}",
+        f"  flags2         : {d['flags2']:#x}",
+        f"  code_text      : {d['code_text']!r}",
+        f"  extra@0x50     : {d['extra']:#010x}",
+        f"  tail_all_zero  : {d['tail_all_zero']}",
+    ]
+    return lines
+
+
 def decode(path: str) -> None:
     with open(path, "rb") as f:
         entry = f.read()
-    if len(entry) != 128:
-        print(f"{path}: unexpected size {len(entry)} (expected 128)", file=sys.stderr)
+    try:
+        d = decode_entry(entry)
+    except ValueError as err:
+        print(f"{path}: {err}", file=sys.stderr)
         return
-
-    (size, itype, version, ncchver, flags0, tmdid, cmdid, flags1,
-     extdataid_low, reserved, flags2) = _ENTRY.unpack_from(entry, 0)
-
-    code = entry[0x30:0x40].rstrip(b"\0").decode("ascii", "replace")
-    extra = struct.unpack_from("<I", entry, 0x50)[0]
-    tail_all_zero = entry[0x54:] == bytes(128 - 0x54)
-
-    print(f"{path}:")
-    print(f"  size_on_sd     : {size:#x} ({size} bytes)")
-    print(f"  type           : {itype:#x}")
-    print(f"  version        : {version:#06x}")
-    print(f"  ncch_version   : {ncchver}")
-    print(f"  flags0         : {flags0:#x}  (bit 0x1: manual CFA present, hint)")
-    print(f"  tmd_content_id : {tmdid:#x}")
-    print(f"  cmd_content_id : {cmdid:#x}")
-    print(f"  flags1         : {flags1:#x}")
-    print(f"  extdata_id_low : {extdataid_low:#010x}")
-    print(f"  reserved2      : {reserved:#010x}")
-    print(f"  flags2         : {flags2:#x}")
-    print(f"  code_text      : {code!r}")
-    print(f"  extra@0x50     : {extra:#010x}")
-    print(f"  tail_all_zero  : {tail_all_zero}")
+    tid = os.path.basename(path)
+    print("\n".join(entry_lines(tid, d)))
     print()
 
 
@@ -75,13 +101,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("extract_dir",
                         help="directory produced by save3ds_fuse --db sdtitle -x")
     parser.add_argument("title_ids", nargs="*", metavar="TITLE_ID",
-                        help="optional title ID(s); omit to inspect every entry")
+                        help="optional title id(s); omit to inspect every entry")
     args = parser.parse_args(argv)
 
     if args.title_ids:
         names = [t.lower() for t in args.title_ids]
     else:
-        names = sorted(n for n in os.listdir(args.extract_dir))
+        names = sorted(n for n in os.listdir(args.extract_dir) if not n.startswith("."))
+    if not names:
+        print(f"no entries found in {args.extract_dir}", file=sys.stderr)
+        return 1
 
     missing = False
     for name in names:

@@ -1,169 +1,172 @@
-# ihaveacreditcard · 3DS custom-install toolkit
+# ihaveacreditcard
 
-> The repo name is a joke riff on **ihaveamac** (author of custom-install).
-> What's inside is a serious, small toolkit: PC-side helpers + field notes for
-> installing retail 3DS game dumps onto a 3DS SD card.
+installing 3ds games onto an sd card from a linux pc. this is the toolkit plus
+the notes i wrote while doing it, so nobody has to retrace the sillier parts.
 
-**Scope: Linux only.** The upstream installer happens to run on Windows/macOS
-too, but every command, path and script in this repo is written around a Linux
-PC (venv, `~/.local/bin`, udisks-style SD mount points, building save3ds).
+it uses:
 
-PC-side helpers and notes for installing retail 3DS game dumps (`.3ds` / `.cia`)
-onto a 3DS SD card from a Linux PC, using:
+- [custom-install](https://github.com/ihaveamac/custom-install) by ihaveamac
+  (the python package): it writes the game, its contents and the title database
+  entries straight onto the sd card
+- [save3ds_fuse](https://github.com/wwylele/save3ds), built and on your PATH
+  (used for the database work)
+- **custom-install-finalize**: the one short console step, ~20 seconds in the
+  homebrew launcher, installs the ticket
 
-- [custom-install](https://github.com/ihaveamac/custom-install) (Python package,
-  `python-package` branch) — writes the title, its contents and the
-  `dbs/title.db` entries directly to the SD card,
-- [save3ds_fuse](https://github.com/wwylele/save3ds) — for database work,
-- **custom-install-finalize** (homebrew app, shipped in the same repo) — the one
-  short console step (~20 seconds) that installs the ticket.
+> the name is a joke on ihaveamac's name. what's inside is real though.
 
-Requires a Luma3DS console with access to the Homebrew Launcher / Homebrew Menu.
+**linux only on the pc side.** the upstream installer also runs on windows and
+macos, but every command, path and script here is written around a linux pc.
 
-> Unofficial personal notes/scripts — not affiliated with or endorsed by
-> Nintendo. The upstream projects linked below do the actual heavy lifting.
+you need a luma3ds console (hbl or hbmenu reachable). dump your own games and
+your own keys; not affiliated with nintendo, obviously.
 
-## Contents
+## easy mode
 
-| Script | Purpose |
-| --- | --- |
-| `scripts/make_cifinish.py` | Build a fresh `cifinish.bin` so finalize (re)installs only the titles you list — e.g. re-run finalize for one title without touching anything else |
-| `scripts/inspect_title_db.py` | Decode title entries extracted from the SD `dbs/title.db`, for verifying an install purely PC-side |
+clone this repo and run:
 
-## Setup (Linux)
-
-Keys must come from your own console (see the
-[3DS Hacks Guide](https://wiki.hacks.guide/wiki/3DS:Dump_system_files) for
-`boot9.bin`, `movable.sed`, and optional `seeddb.bin`):
-
-```sh
-mkdir -p ~/3ds
-# place boot9.bin, movable.sed and (optionally) seeddb.bin in ~/3ds/
+```
+python3 scripts/tui.py
 ```
 
-Install the installer into a venv so nothing touches system Python:
+it checks your keys, finds mounted sd card candidates, installs dumps and can
+write `cifinish.bin` for the finalize step — guided menus all the way, with a
+plain numbered-menu fallback (`--plain`) for weird terminals. `install.sh`
+bootstraps a fresh linux box (distro packages, save3ds build, venv).
 
-```sh
+## setup
+
+keys have to come from your own console ([3ds hacks guide][guide] explains
+dumping system files). i keep mine in `~/3ds/`:
+
+[guide]: https://wiki.hacks.guide/wiki/3DS:Dump_system_files
+
+```
+mkdir -p ~/3ds
+# boot9.bin and movable.sed go in there, seeddb.bin if you have one
+```
+
+python side (venv, so nothing touches the system python):
+
+```
 python3 -m venv ~/.venvs/custom-install
 ~/.venvs/custom-install/bin/pip install --upgrade \
   https://github.com/ihaveamac/custom-install/archive/refs/heads/python-package.zip
 ```
 
-Build [`save3ds`](https://github.com/wwylele/save3ds) per its README and put
-`save3ds_fuse` on `PATH` (e.g. `~/.local/bin/`). The installer also looks for
-`boot9.bin` / `seeddb.bin` in `~/3ds/` by default.
+build save3ds per its README and drop `save3ds_fuse` somewhere on PATH, e.g.
+`~/.local/bin/`. the installer finds boot9/seeddb in `~/3ds/` on its own.
 
-## Installing a game dump
+## installing a dump
 
-`$SD` below means the mount point of the (FAT32) 3DS SD card.
+`$SD` is where the sd card is mounted.
 
-```sh
+```
 ~/.venvs/custom-install/bin/custominstall \
-  -b ~/3ds/boot9.bin \
-  -m ~/3ds/movable.sed \
-  -s ~/3ds/seeddb.bin \
+  -b ~/3ds/boot9.bin -m ~/3ds/movable.sed -s ~/3ds/seeddb.bin \
   --sd "$SD" \
   "Game (USA).3ds"
 ```
 
-- Decrypted, trimmed `.3ds` dumps work directly (conversion happens via the
-  bundled 3dsconv; `.cia` inputs are also accepted).
-- Then eject the card, and on the console: Homebrew Launcher →
-  **custom-install-finalize** → wait → reboot. That single step installs the
-  ticket (finalize *generates* the ticket itself — the PC side never needs
-  ticket cryptography) plus the seed, if one is required for that title.
+decrypted trimmed `.3ds` dumps work directly (`.cia` too — 3dsconv does the
+conversion for you).
 
-## Re-finalizing a single title
+then: eject, homebrew launcher → custom-install-finalize → wait → reboot.
+finalize builds the ticket itself — the pc side never needs ticket crypto.
 
-If a title shows up on HOME but misbehaves, re-run finalize for just that
-title. Build a minimal `cifinish.bin` and put it at the card root:
+## when a game is on home but crashes on launch
 
-```sh
+work down this ladder:
+
+1. re-finalize just that one title:
+
+```
 python3 scripts/make_cifinish.py -o "$SD/cifinish.bin" 0004000000125500
 ```
 
-Then eject → Homebrew Launcher → **custom-install-finalize** → reboot → test.
-It is safe to re-finalize a title whose ticket was already installed; finalize
-replaces it, and only the titles listed in the file are touched.
+   then hbl → finalize → reboot → test. safe even if the ticket already
+   exists, and only the listed titles get touched.
 
-## Verifying an install PC-side
+2. FBI reinstall: delete the title in FBI (Titles), then install the `.cia`
+   from the card root, test again.
 
-Extract the title entries from the card's title database with save3ds (run
-while the card is mounted):
+3. still crashing? then the dump itself is the suspect. use another dump.
 
-```sh
+## checking the pc side before blaming the console
+
+```
 rm -rf /tmp/dbcheck
 save3ds_fuse --db sdtitle -x /tmp/dbcheck \
   -m ~/3ds/movable.sed -b ~/3ds/boot9.bin "$SD"
 python3 scripts/inspect_title_db.py /tmp/dbcheck 0004000000125500
 ```
 
-Things to sanity-check against the saved install log:
+things to sanity check against your install log:
 
-- the content sizes on the card match the CIA/TMD
-  (`Nintendo 3DS/<id0>/<id1>/title/00040000/<title low>/content/*.app`),
-- `.sav` file sizes match the TMD save size,
-- the DB entry exists with the expected content ids / flags.
+- content sizes on the card match the cia/tmd
+  (`Nintendo 3DS/<id0>/<id1>/title/00040000/<title low>/content/`)
+- `.sav` file sizes match the tmd save size
+- the db entry is there, with the content ids / flags you expect
 
-## Removing an installed title
+## removing a title
 
-This is **not** doable from the PC: `dbs/title.db` on the SD card is a
-proprietary database wrapped in per-console SD crypto + CMAC — there is no
-plain database file to edit. On the console with FBI:
+not from the pc. `dbs/title.db` on the card is wrapped in per-console sd
+crypto + cmac, there is no plain database file to edit. FBI on the console
+does it: Titles → (title) → Delete. if a ticket lingers after deleting the
+contents some other way, FBI → Tickets handles the leftovers.
 
-- **Titles → (title) → Delete** removes the title,
-- if a leftover ticket remains (e.g. title contents were deleted another way),
-  **FBI → Tickets** can remove the orphan ticket.
+## seeds
 
-## Troubleshooting notes
+keep a seeddb around for 2015+ games, but most of those games don't use seed
+crypto at all. checked over here: us mm3d (`0004000000125500`) and us fates se
+(`0004000000179800`) are not seed-encrypted, while mm3d twn/kor are. region
+matters — don't chase seeds for titles that don't need them.
 
-- **Title appears on HOME but crashes to an ARM11 exception on launch.** Work
-  down this ladder:
-  1. Re-finalize just that title (see above).
-  2. FBI reinstall: delete the title in FBI *Titles*, then install the
-     converted `.cia` from the card root in FBI (SD), and test again.
-  3. If it still crashes, the dump itself is likely bad — re-dump or source a
-     different one.
-- **Seeds.** Keep a SeedDB around and reasonably fresh for 2015+ games, but
-  note that *most* games of that era do not use seed crypto at all. Verified
-  from the NCCH flags (`uses_seed`) over several titles: US original dumps of
-  Majora's Mask 3D (`0004000000125500`) and Fire Emblem Fates: Special Edition
-  (`0004000000179800`) are **not** seed-encrypted, while Majora's Mask 3D
-  TWN/KOR *are* — region matters, so don't chase seeds for titles that don't
-  need them.
+these tool gotchas (save3ds argument shapes, ticket/cifinish lifecycle, card
+db realities) plus the fixes this repo routes around them are written up in
+[docs/quirks-and-fixes.md](docs/quirks-and-fixes.md).
 
-## cifinish.bin format reference (version 3)
+## scripts
+
+- `scripts/tui.py` — the guided ui: checks keys, finds mounted sd cards,
+  installs dumps, lists titles on the card and writes `cifinish.bin`
+  (`--plain` for a numbered menu on dumb terminals / over ssh)
+- `scripts/make_cifinish.py` — non-interactive way to write a fresh
+  `cifinish.bin` listing only the titles you pass
+- `scripts/inspect_title_db.py` — decodes the 128-byte title entries save3ds
+  extracts from the card's title.db (each extracted file is one entry, named
+  after the title id)
+- `install.sh` — one-shot bootstrap for a fresh linux box: distro packages,
+  save3ds build, python venv with custom-install (`--dry-run` to preview)
+
+## cifinish.bin (v3) format
 
 ```
-offset size value
-0x00   8    ASCII "CIFINISH"
-0x08   4    version, u32 little-endian (3)
-0x0C   4    entry count, u32 little-endian
--- per entry, 0x20 bytes:
-0x00   6    ASCII "TITLE\0"
-0x06   1    has_seed (0 = none, 1 = seed bytes present)
-0x07   1    padding (0)
-0x08   8    title ID, u64 little-endian
-0x10   16   seed (16 zero bytes when has_seed = 0)
+cifinish.bin v3, values little-endian
+"CIFINISH"     8 bytes
+version        u32 = 3
+entry count    u32
+--- per entry (0x20 bytes):
+"TITLE\0"      6 bytes
+has_seed       u8,  0 = no seed
+padding        u8 = 0
+title id       u64
+seed           16 bytes, all zero when has_seed = 0
 ```
 
-There is no ticket data in the file — finalize builds the ticket on the
-console. Treat `cifinish.bin` as single-use: once finalize has consumed it,
-build a fresh file for any follow-up work.
+no ticket data in the file — finalize builds the ticket on the console. the
+file is single-use: once finalize has eaten it, write a new one for the next
+job.
 
-## Credits / upstream
+## credits
 
-- [custom-install](https://github.com/ihaveamac/custom-install) by ihaveamac
-  and contributors (includes the `custom-install-finalize` homebrew app).
-- [save3ds](https://github.com/wwylele/save3ds) by wwylele (database/FUSE
-  tooling).
-- [3dsconv](https://github.com/ihaveamac/3dsconv) (installed as a dependency of
-  custom-install).
+- custom-install by ihaveamac and contributors (ships the finalize homebrew
+  app too)
+- save3ds by wwylele
+- 3dsconv by ihaveamac (installed as a dependency of custom-install)
 
-These notes were written during hands-on use of the above tools; all the real
-functionality is theirs. This repo only documents the procedures and adds the
-two small scripts.
+all the real functionality is theirs. my part here is the notes, the scripts,
+the tui and install.sh — that part is MIT (see [LICENSE](LICENSE)) and applies
+to this repo only, not to the upstream projects.
 
-## License
-
-MIT — see [LICENSE](LICENSE).
+individual shout-outs live in [THANKS.md](THANKS.md).

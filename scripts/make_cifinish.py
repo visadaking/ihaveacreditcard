@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
-"""Build a cifinish.bin for custom-install-finalize.
+"""build a fresh cifinish.bin for custom-install-finalize.
 
-custom-install writes cifinish.bin so the homebrew custom-install-finalize app
-knows which SD-installed titles to finalize (install the ticket, add the seed
-if required). The file is single-use input for finalize: once processed, its
-job is done.
+custom-install writes cifinish.bin which tells the finalize homebrew app which
+sd-installed titles to finalize (install the ticket, add the seed if one is
+needed). finalize treats the file as single-use: once it processed the titles,
+the file's job is done.
 
-Use this script to build a *fresh* file listing only certain titles, e.g. to
-re-run finalize for a single title without redoing a full install:
+use this script to write a new file that only lists the titles you pass, e.g.
+to re-run finalize for one title on its own:
 
     make_cifinish.py -o "$SD/cifinish.bin" 0004000000125500
 
-Then eject the card, run custom-install-finalize from the Homebrew Launcher on
-the console, and reboot. Re-finalizing already-finalized titles is safe; only
-the listed titles are touched.
+then eject the card, run custom-install-finalize from the homebrew launcher on
+the console and reboot. re-finalizing titles that were already finalized is
+safe — only the listed titles get touched.
 
-Format (cifinish v3):
+format (cifinish v3):
 
     offset size value
-    0x00   8    ASCII "CIFINISH"
+    0x00   8    ascii "CIFINISH"
     0x08   4    version, u32 little-endian (= 3)
     0x0C   4    entry count, u32 little-endian
     --- per entry, 0x20 bytes:
-    0x00   6    ASCII "TITLE\\0"
+    0x00   6    ascii "TITLE\\0"
     0x06   1    has_seed (0 = none, 1 = seed bytes present)
     0x07   1    padding (0)
-    0x08   8    title ID, u64 little-endian
+    0x08   8    title id, u64 little-endian
     0x10   16   seed (16 zero bytes when has_seed = 0)
 
-There is no ticket data in the file; finalize constructs the ticket itself on
-the console. Only pass --seed for titles that actually require a seed.
+no ticket data goes in the file — finalize builds the ticket itself on the
+console. only pass --seed for titles that actually need one.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("title_ids", metavar="TITLE_ID", nargs="+",
-                        help="title ID(s), 16 hex digits")
+                        help="title id(s), 16 hex digits")
     parser.add_argument("-o", "--out", default="cifinish.bin",
                         help="output path (default: %(default)s)")
     parser.add_argument("--seed", action="append", default=[], metavar="TID:HEX",
@@ -94,10 +94,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         title_ids = [int(t, 16) for t in args.title_ids]
     except ValueError:
-        parser.error("title IDs must be 16 hex digits")
+        parser.error("title ids must be 16 hex digits")
     for tid in title_ids:
         if not 0 <= tid < 1 << 64:
-            parser.error(f"title ID out of range: {args.title_ids[title_ids.index(tid)]}")
+            parser.error(f"title id out of range: {args.title_ids[title_ids.index(tid)]}")
 
     seeds: dict[int, bytes] = {}
     try:
@@ -114,8 +114,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"wrote {len(data)} bytes to {args.out}")
     dump(data)
     print("\nnext steps:")
-    print(" 1. put this file at the root of the SD card (when not written there directly)")
-    print(" 2. insert the card into the 3DS and open the Homebrew Launcher")
+    print(" 1. put this file at the root of the sd card (when not written there directly)")
+    print(" 2. insert the card into the 3ds and open the homebrew launcher")
     print(" 3. run custom-install-finalize and wait (~20 s)")
     print(" 4. reboot and test")
     return 0
