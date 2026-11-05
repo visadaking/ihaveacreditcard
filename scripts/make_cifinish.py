@@ -49,6 +49,8 @@ def parse_seed(spec: str) -> tuple[int, bytes]:
         seed = bytes.fromhex(seed_hex)
     except ValueError as err:
         raise argparse.ArgumentTypeError(str(err)) from None
+    if not 0 <= tid < 1 << 64:
+        raise argparse.ArgumentTypeError("title id must fit in 64 bits (16 hex digits)")
     if len(seed) != 16:
         raise argparse.ArgumentTypeError("seed must be 32 hex digits (16 bytes)")
     return tid, seed

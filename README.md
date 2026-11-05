@@ -1,7 +1,6 @@
 # ihaveacreditcard
 
-installing 3ds games onto an sd card from a linux pc. this is the toolkit plus
-the notes i wrote while doing it, so nobody has to retrace the sillier parts.
+installing 3ds games onto an sd card from a linux pc.
 
 it uses:
 
@@ -96,8 +95,8 @@ python3 scripts/make_cifinish.py -o "$SD/cifinish.bin" 0004000000125500
 
 ```
 rm -rf /tmp/dbcheck
-save3ds_fuse --db sdtitle -x /tmp/dbcheck \
-  -m ~/3ds/movable.sed -b ~/3ds/boot9.bin "$SD"
+save3ds_fuse --db sdtitle -x --sd "$SD" \
+  -m ~/3ds/movable.sed -b ~/3ds/boot9.bin /tmp/dbcheck
 python3 scripts/inspect_title_db.py /tmp/dbcheck 0004000000125500
 ```
 
@@ -130,14 +129,25 @@ db realities) plus the fixes this repo routes around them are written up in
 
 - `scripts/tui.py` — the guided ui: checks keys, finds mounted sd cards,
   installs dumps, lists titles on the card and writes `cifinish.bin`
-  (`--plain` for a numbered menu on dumb terminals / over ssh)
+  (`--plain` for a numbered menu on dumb terminals / over ssh). on every
+  launch it auto-snapshots the card's dbs + `cifinish.bin` into
+  `~/Documents/ihaveacreditcard-backups/`, copies the `.sav` files before any
+  run that would overwrite saves, and keeps the newest 30 snapshots
+- `scripts/doctor.py` — the self-check on its own: python version, key files
+  verified by magic bytes + size (not just existence), that save3ds_fuse and
+  custominstall actually execute, and that the card is mounted writable.
+  `--strict` turns warnings into failures for scripting; the tui's menu has
+  the same check, and `python3 scripts/tui.py --check` runs it non-interactively
 - `scripts/make_cifinish.py` — non-interactive way to write a fresh
   `cifinish.bin` listing only the titles you pass
 - `scripts/inspect_title_db.py` — decodes the 128-byte title entries save3ds
   extracts from the card's title.db (each extracted file is one entry, named
   after the title id)
-- `install.sh` — one-shot bootstrap for a fresh linux box: distro packages,
-  save3ds build, python venv with custom-install (`--dry-run` to preview)
+- `install.sh` — one-shot bootstrap for a fresh linux box: distro packages
+  (apt/dnf/pacman/zypper/apk — which also covers non-systemd distros like void
+  or artix — plus xbps/emerge, and manual hints on nixos), save3ds build,
+  python venv with custom-install (`--dry-run` to preview). zero systemd is
+  used anywhere in the toolkit.
 
 ## cifinish.bin (v3) format
 

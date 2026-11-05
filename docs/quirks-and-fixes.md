@@ -58,3 +58,11 @@ them. sorted by which program they belong to.
   the ncch `uses_seed` flag), while mm3d twn/kor are. so don't chase seeds
   for titles that don't need them — nothing beats verifying from the actual
   ncch flags for the specific dump you have.
+
+## what one card's lived experience says
+
+- a fresh cifinish (mm3d only) + a second finalize run did **not** stop the
+  mm3d launch crash on the card behind these notes. the ladder's remaining
+  rungs (fbi reinstall from a re-converted cia sitting at the card root, then
+  replacing the dump) are the standing suspects — if you hit the same, don't
+  burn hours on seeds first.

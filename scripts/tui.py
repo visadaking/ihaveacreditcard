@@ -14,11 +14,13 @@ back to a plain numbered menu that offers the exact same functions.
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -35,6 +37,17 @@ FAT_TYPES = {"vfat", "exfat", "msdos", "fat", "ufsd", "tf_fat"}
 DUMP_EXTS = (".3ds", ".3dz", ".cia")
 PACKAGE_URL = ("https://github.com/ihaveamac/custom-install/archive/"
                "refs/heads/python-package.zip")
+
+# auto backups: small, hard-to-regenerate card files land here before the
+# toolkit touches anything risky
+BACKUP_DIRNAME = "ihaveacreditcard-backups"
+BACKUP_KEEP_DEFAULT = 30
+BACKUP_COPY_LIMIT = 100 * 1024 * 1024  # single files above this are skipped
+CARD_DB_PATTERNS = (
+    ("Nintendo 3DS/*/*/dbs/title.db", "title.db"),
+    ("Nintendo 3DS/*/*/dbs/import.db", "import.db"),
+    ("Nintendo 3DS/*/*/dbs/certs.db", "certs.db"),
+)
 
 CONSOLE_STEPS = [
     "next on the 3ds:",
@@ -56,31 +69,38 @@ def _env_file(name: str) -> str | None:
     return val if val and os.path.isfile(val) else None
 
 
+def _usable(path) -> str | None:
+    """empty files count as missing (truncated/copied-wrong dumps)."""
+    try:
+        return str(path) if path and os.path.isfile(path) \
+            and os.path.getsize(path) > 0 else None
+    except OSError:
+        return None
+
+
 def find_file(name: str, env_name: str = "") -> str | None:
     if env_name:
-        hit = _env_file(env_name)
+        hit = _usable(_env_file(env_name))
         if hit:
             return hit
     for d in KEY_DIRS:
-        p = Path(d).expanduser() / name
-        if p.is_file():
-            return str(p)
-    hit = shutil.which(name)
-    return hit if hit else None
+        hit = _usable(Path(d).expanduser() / name)
+        if hit:
+            return str(hit)
+    return _usable(shutil.which(name))
 
 
 def find_tool(name: str, extra_candidates=()) -> str | None:
     for candidate in extra_candidates:
         if not candidate:
             continue
-        p = Path(candidate).expanduser()
-        if p.is_file():
-            return str(p)
+        hit = _usable(Path(candidate).expanduser())
+        if hit:
+            return str(hit)
     hit = shutil.which(name)
     if hit:
-        return hit
-    p = Path("~/.local/bin").expanduser() / name
-    return str(p) if p.is_file() else None
+        return _usable(hit)
+    return _usable(Path("~/.local/bin").expanduser() / name)
 
 
 def probe(ctx: dict) -> dict:
@@ -116,7 +136,9 @@ def sd_candidates() -> list[dict]:
             free = shutil.disk_usage(mnt).free
         except OSError:
             free = -1
-        out.append({"mount": mnt, "fs": fstype, "free": free, "media": is_media})
+        mnt_opts = parts[3].split(",") if len(parts) > 3 else []
+        out.append({"mount": mnt, "fs": fstype, "free": free, "media": is_media,
+                    "ro": "ro" in mnt_opts})
     out.sort(key=lambda c: (not c["media"], c["mount"]))
     return out
 
@@ -126,18 +148,180 @@ def tilde(path: str) -> str:
     return "~" + path[len(home):] if path.startswith(home) else path
 
 
+# --------------------------------------------------------------------------- #
+# auto backups (into the user's documents folder, every run)
+# --------------------------------------------------------------------------- #
+
+def documents_dir() -> str:
+    """the user's documents folder (plain names first — some xdg setups
+    happily claim $HOME itself — then xdg, then a least-bad fallback)."""
+    env = os.environ.get("IHC_BACKUP_DIR", "").strip()
+    if env:
+        cand = os.path.expandvars(os.path.expanduser(env))
+        if cand and os.path.isdir(cand):
+            return cand
+    home = os.path.expanduser("~")
+    for name in ("Documents", "Dokumente", "documents"):
+        cand = os.path.join(home, name)
+        if os.path.isdir(cand):
+            return cand
+    try:
+        out = subprocess.run(["xdg-user-dir", "DOCUMENT"],
+                             capture_output=True, text=True, timeout=5)
+        got = out.stdout.strip()
+        if out.returncode == 0 and got and os.path.isdir(got) \
+                and os.path.realpath(got) != os.path.realpath(home):
+            return got
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return os.path.join(home, ".local", "share")  # least-bad fallback
+
+
+def backup_keep_count() -> int:
+    try:
+        return max(1, int(os.environ.get("IHC_BACKUP_KEEP", BACKUP_KEEP_DEFAULT)))
+    except ValueError:
+        return BACKUP_KEEP_DEFAULT
+
+
+def card_backup_root() -> str:
+    base = os.path.join(documents_dir(), BACKUP_DIRNAME)
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        return ""
+    return base
+
+
+def prune_backups(base: str) -> None:
+    """keep only the newest few snapshots, folders and files both count."""
+    if not base or not os.path.isdir(base):
+        return
+    names = sorted((n for n in os.listdir(base) if n[:1].isdigit()), reverse=True)
+    for old in names[backup_keep_count():]:
+        victim = os.path.join(base, old)
+        try:
+            if os.path.isdir(victim) and not os.path.islink(victim):
+                shutil.rmtree(victim, ignore_errors=True)
+            else:
+                os.remove(victim)
+        except OSError:
+            pass
+
+
+def _copy_within(src: str, dest_dir: str, name: str) -> bool:
+    try:
+        if os.path.getsize(src) > BACKUP_COPY_LIMIT:
+            return False
+        os.makedirs(dest_dir, exist_ok=True)
+        shutil.copy2(src, os.path.join(dest_dir, name))
+        return True
+    except OSError:
+        return False
+
+
+def auto_backup(ctx: dict) -> str:
+    """snapshot the card's small, hard-to-regenerate state (dbs + cifinish)."""
+    sd = ctx.get("sd")
+    if not sd:
+        return ""
+    base = ctx.get("backup_root") or card_backup_root()
+    if not base:
+        return ""
+    dest = os.path.join(base, time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError:
+        return ""
+    copied: list[str] = []
+    for pattern, name in CARD_DB_PATTERNS:
+        for i, src in enumerate(glob.glob(os.path.join(sd, pattern))):
+            if _copy_within(src, dest, name if i == 0 else f"{i}-{name}"):
+                copied.append(name)
+    card_cifinish = os.path.join(sd, "cifinish.bin")
+    if os.path.isfile(card_cifinish) and _copy_within(card_cifinish, dest, "cifinish.bin"):
+        copied.append("cifinish.bin")
+    if not copied:  # not a 3ds card layout → don't leave empty noise dirs
+        try:
+            os.rmdir(dest)
+        except OSError:
+            pass
+        return ""
+    try:
+        with open(os.path.join(dest, "snapshot.txt"), "w", encoding="utf-8") as f:
+            f.write("auto snapshot taken when the tui started (before it touched anything)\n")
+            f.write(f"mount: {sd}\n")
+            f.write(f"files: {', '.join(dict.fromkeys(copied))}\n")
+    except OSError:
+        pass
+    prune_backups(base)
+    return dest
+
+
+def quick_backup_file(path: str, label: str) -> str:
+    """copy one file to its own backup dir; returns the dir or ''."""
+    base = card_backup_root()
+    if not base:
+        return ""
+    dest = os.path.join(base, time.strftime("%Y%m%d-%H%M%S") + "-" + label)
+    if _copy_within(path, dest, os.path.basename(path)):
+        prune_backups(base)
+        return dest
+    return ""
+
+
+def backup_saves(ctx: dict) -> str:
+    """copy every .sav on the card (runs before --overwrite-saves can eat them)."""
+    sd = ctx.get("sd")
+    if not sd:
+        return ""
+    base = ctx.get("backup_root") or card_backup_root()
+    if not base:
+        return ""
+    pattern = os.path.join(sd, "Nintendo 3DS", "*", "*", "title", "*", "*",
+                           "data", "**", "*.sav")
+    hits = glob.glob(pattern, recursive=True)
+    if not hits:
+        return ""
+    dest = os.path.join(base, time.strftime("%Y%m%d-%H%M%S") + "-saves")
+    rel_root = os.path.join(sd, "Nintendo 3DS")
+    copied = 0
+    for src in hits:
+        rel = os.path.relpath(src, rel_root)
+        if _copy_within(src, os.path.join(dest, os.path.dirname(rel)),
+                        os.path.basename(rel)):
+            copied += 1
+    if not copied:
+        return ""
+    prune_backups(base)
+    return dest
+
+
+def write_inventory(ctx: dict, entries: list[dict]) -> None:
+    """drop the titles table in the backup dir as a timestamped text file."""
+    base = ctx.get("backup_root") or card_backup_root()
+    if not entries or not base:
+        return
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    with open(os.path.join(base, f"{stamp}-titles.txt"), "w", encoding="utf-8") as f:
+        f.write(f"# titles on {ctx.get('sd') or '?'} at {stamp}\n")
+        f.write("\n".join(titles_table(entries)))
+        f.write("\n")
+
+
 def status_header(ctx: dict) -> list[str]:
     def fmt(p: str | None) -> str:
         return tilde(p) if p else "MISSING"
-    lines = [
+    bdir = ctx.get("backup_dir") or ctx.get("backup_root") or ""
+    return [
         f"boot9      : {fmt(ctx['boot9'])}",
         f"movable.sed: {fmt(ctx['movable'])}",
         f"seeddb     : {fmt(ctx['seeddb'])}",
         f"save3ds    : {fmt(ctx['save3ds'])}",
         f"installer  : {fmt(ctx['installer'])}",
         f"sd card    : {fmt(ctx['sd'])}",
+        f"backups    : {tilde(bdir) if bdir else 'off'}",
     ]
-    return lines
 
 
 # --------------------------------------------------------------------------- #
@@ -196,6 +380,10 @@ def cache_titles(ui, ctx: dict) -> list[dict]:
     entries = ui.run_visible(lambda: extract_titles(ctx))
     ctx["titles"] = entries
     ctx["titles_sd"] = ctx["sd"]
+    try:
+        write_inventory(ctx, entries)  # history of what the card held, per run
+    except OSError:
+        pass
     return entries
 
 
@@ -231,8 +419,9 @@ def pick_sd(ui, ctx: dict) -> None:
         ctx["sd"] = media[0]["mount"]
         free = media[0]["free"]
         human = f"{free / (1024 ** 3):.1f} GiB free" if free >= 0 else "size unknown"
-        print(f"picked the sd card automatically: {media[0]['mount']} "
-              f"({media[0]['fs']}, {human})")
+        print("picked the sd card automatically: "
+              f"{media[0]['mount']} ({media[0]['fs']}, {human})"
+              + (" READ-ONLY MOUNT!" if media[0].get("ro") else ""))
         lines = [f"picked the sd card without asking: {media[0]['mount']}"]
         ctx["sd_note"] = lines[0]
         return
@@ -240,10 +429,14 @@ def pick_sd(ui, ctx: dict) -> None:
     if not cands:
         ui.page("no fat/exfat mounts found",
                 ["is the card plugged in? weird fs? type the path manually below."])
-    rows = [f"{c['mount']}  ({c['fs']}, {c['free'] / 1024 ** 3:.1f} GiB free)"
-           if c["free"] >= 0 else f"{c['mount']}  ({c['fs']})" for c in cands]
+    rows = [
+        (f"{c['mount']}  ({c['fs']}, {c['free'] / 1024 ** 3:.1f} GiB free)"
+         + (" READ-ONLY MOUNT!" if c.get("ro") else ""))
+        if c["free"] >= 0 else f"{c['mount']}  ({c['fs']})"
+        for c in cands
+    ]
     rows.append("type a path manually")
-    print("\nassy sd card candidates:")
+    print("\nsd card candidates:")
     picks = ui.pick_many("sd card candidates", rows)
     if not picks:
         return
@@ -281,7 +474,7 @@ def scan_dumps(directory: str) -> list[str]:
 
 
 def flow_install(ui, ctx: dict) -> None:
-    if gateway(ctx, need=("installer", "movable", "boot9"), ui=ui) is None:
+    if gateway(ctx, need=("installer", "save3ds", "movable", "boot9"), ui=ui) is None:
         return
     dir_ = pick_dump_dir(ui)
     dumps = scan_dumps(dir_)
@@ -297,6 +490,9 @@ def flow_install(ui, ctx: dict) -> None:
     if not dumps:
         return
     overwrite = ui.confirm("overwrite existing save files?", default=False)
+    # --overwrite-saves can eat real save data → auto-copy the existing .sav
+    # files into the documents backup folder before the installer runs
+    saves_backup = backup_saves(ctx) if overwrite else ""
     cmd = [ctx["installer"]]
     if ctx["boot9"]:
         cmd += ["-b", ctx["boot9"]]
@@ -314,9 +510,20 @@ def flow_install(ui, ctx: dict) -> None:
     rc = ui.run_visible(lambda: subprocess.run(cmd).returncode)
     lines = [f"custominstall exited with status {rc}."]
     if rc == 0:
-        lines += [f"content written to {tilde(ctx['sd'])}", "\a done pc-side."] + CONSOLE_STEPS
+        ctx["titles"] = None  # the card listing changed → refresh on next read
+        ctx["titles_sd"] = None
+        lines += [
+            f"content written to {tilde(ctx['sd'])}",
+            "double-check the output above for '--skip-contents' hints or",
+            "per-title failures before trusting it fully.",
+        ]
+        if saves_backup:
+            lines.append(f"old save files backed up to {tilde(saves_backup)}")
+        lines += CONSOLE_STEPS
     else:
         lines += ["check the output above for the failure reason."]
+        if saves_backup:
+            lines.append(f"note: existing saves were backed up to {tilde(saves_backup)}")
     ui.page("install result", lines)
 
 
@@ -332,6 +539,32 @@ def flow_list(ui, ctx: dict) -> None:
     ui.page(f"titles on {tilde(ctx['sd'])}", titles_table(entries))
 
 
+def read_existing_seeds(path: str) -> dict[int, bytes]:
+    """pull seeds out of an existing cifinish.bin (v3 layout) if one is there."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return {}
+    seeds: dict[int, bytes] = {}
+    if raw[:8] != b"CIFINISH":
+        return seeds
+    try:
+        version = int.from_bytes(raw[8:12], "little")
+        count = int.from_bytes(raw[12:16], "little")
+        if version != 3:
+            return seeds
+        for i in range(count):
+            entry = raw[0x10 + i * 0x20: 0x10 + (i + 1) * 0x20]
+            if len(entry) != 0x20 or entry[:6] != b"TITLE\0":
+                break
+            if entry[6]:
+                seeds[int.from_bytes(entry[8:16], "little")] = entry[0x10:]
+    except (ValueError, IndexError):
+        pass
+    return seeds
+
+
 def flow_cifinish(ui, ctx: dict) -> None:
     if gateway(ctx, need=("save3ds", "movable", "boot9"), ui=ui) is None:
         return
@@ -339,21 +572,29 @@ def flow_cifinish(ui, ctx: dict) -> None:
     if not entries:
         ui.page("nothing to re-finalize", titles_table(entries))
         return
-    picks = ui.pick_many("pick title(s) to re-finalize (see them listed here)", titles_table(entries))
+    rows = titles_table(entries)[1:]  # titles_table prepends a header row
+    picks = ui.pick_many("pick title(s) to re-finalize", rows)
     if not picks:
         return
     tids = [int(entries[i - 1]["tid"], 16) for i in picks]
     default_out = os.path.join(ctx["sd"], "cifinish.bin")
-    out = ui.ask("output path", default_out)
-    if os.path.exists(out) and not ui.confirm(f"{out} exists — overwrite?", default=False):
+    out = os.path.expandvars(os.path.expanduser(ui.ask("output path", default_out)))
+    # whatever is being replaced gets copied to the documents backup first
+    backed = quick_backup_file(out, "cifinish") if os.path.exists(out) else ""
+    if backed and not ui.confirm(
+            f"{out} exists — overwrite? (old copy → {tilde(backed)})", default=False):
         return
-    data = build_cifinish(tids, {})
+    # carry over the seeds a previous custom-install run stored, so a
+    # seed-encrypted title doesn't lose its seed on re-finalize
+    seeds = {t: s for t, s in read_existing_seeds(out).items() if t in tids}
+    data = build_cifinish(tids, seeds)
     with open(out, "wb") as f:
         f.write(data)
-    ui.page("cifinish.bin written", [
-        f"wrote {len(data)} bytes to {out} for: {', '.join(hex(t) for t in tids)}",
-        "",
-    ] + CONSOLE_STEPS)
+    note = f" ({len(seeds)} seed(s) carried over)" if seeds else ""
+    lines = [f"wrote {len(data)} bytes to {out} for {len(tids)} title(s){note}"]
+    if backed:
+        lines.append(f"previous file backed up to {tilde(backed)}")
+    ui.page("cifinish.bin written", lines + [""] + CONSOLE_STEPS)
 
 
 def flow_inspect(ui, ctx: dict) -> None:
@@ -389,12 +630,19 @@ def flow_toolchain(ui, ctx: dict) -> None:
         f"python is {sys.executable}", default=True):
         ui.page("skipped", ["you can do it manually, see the readme's setup section"])
         return
-    rc = _do()
+    rc = ui.run_visible(_do)
     probe(ctx)
     status = "ssh, it worked" if rc == 0 and ctx["installer"] else f"setup exited with {rc}"
     if rc == 0 and ctx["installer"]:
         status += f"\ninstaller now: {tilde(ctx['installer'])}"
     ui.page("toolchain", [status] + (CONSOLE_STEPS if rc == 0 else []))
+
+
+def flow_check(ui, ctx: dict) -> None:
+    """the same doctor that --check runs, but inside the menus."""
+    import doctor
+    findings, warns, fails = doctor.collect()
+    ui.page("setup check", doctor.page_lines(findings, warns, fails))
 
 
 FLOWS = {
@@ -403,6 +651,7 @@ FLOWS = {
     "cifinish": flow_cifinish,
     "inspect": flow_inspect,
     "toolchain": flow_toolchain,
+    "check": flow_check,
 }
 
 
@@ -413,6 +662,7 @@ def main_options(_ctx: dict) -> list[tuple[str, str]]:
         ("build cifinish.bin (re-finalize helper)", "cifinish"),
         ("inspect a title entry (pc-side check)", "inspect"),
         ("install the python toolchain (venv + pip)", "toolchain"),
+        ("run a setup check (doctor)", "check"),
         ("rescan keys / tools / sd cards", "rescan"),
         ("quit", "quit"),
     ]
@@ -420,9 +670,12 @@ def main_options(_ctx: dict) -> list[tuple[str, str]]:
 
 def run_app(ui, ctx: dict) -> None:
     probe(ctx)
+    ctx["backup_root"] = card_backup_root() or ctx.get("backup_root") or ""
     if ctx["sd"] is None:
         pick_sd(ui, ctx)
         ctx["sd_confirmed"] = True
+    if ctx["sd"]:  # one snapshot per launch: dbs + cifinish.bin, cheap files only
+        ctx["backup_dir"] = auto_backup(ctx)
     while True:
         opts = main_options(ctx)
         idx = ui.menu(APP_TITLE, [label for label, _ in opts], header=status_header(ctx))
@@ -434,8 +687,11 @@ def run_app(ui, ctx: dict) -> None:
         if action == "rescan":
             ctx["sd"] = None
             probe(ctx)
+            ctx["sd_confirmed"] = False
             pick_sd(ui, ctx)
             ctx["sd_confirmed"] = True
+            if ctx["sd"]:  # card changed? snapshot the new one too
+                ctx["backup_dir"] = auto_backup(ctx)
             continue
         try:
             FLOWS[action](ui, ctx)
@@ -487,73 +743,78 @@ class PlainIO:
 
     def page(self, title: str, lines) -> None:
         self._suspend()
-        print()
-        print(f"== {title} ==")
-        for line in lines:
-            print(f"  {line}")
-        self.pause()
-        self._resume()
+        try:
+            print()
+            print(f"== {title} ==")
+            for line in lines:
+                print(f"  {line}")
+            self.pause()
+        finally:
+            self._resume()
 
     def menu(self, title: str, options: list[str], header=()):
         self._suspend()
-        print()
-        print(f"== {title} ==")
-        for line in header:
-            print(f"  {line}")
-        for i, label in enumerate(options, 1):
-            print(f" {i}. {label}")
-        while True:
-            try:
-                raw = input("? ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return None
-            if raw in ("q", "x", "quit", "exit"):
-                return None
-            try:
-                idx = int(raw)
-            except ValueError:
-                print("give a number between 1 and %d (or q)" % len(options))
-                continue
-            if 1 <= idx <= len(options):
-                return idx - 1
-            print("that number's out of range (or q to quit)")
+        try:
+            print()
+            print(f"== {title} ==")
+            for line in header:
+                print(f"  {line}")
+            for i, label in enumerate(options, 1):
+                print(f" {i}. {label}")
+            while True:
+                try:
+                    raw = input("? ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return None
+                if raw in ("q", "x", "quit", "exit"):
+                    return None
+                try:
+                    idx = int(raw)
+                except ValueError:
+                    print("give a number between 1 and %d (or q)" % len(options))
+                    continue
+                if 1 <= idx <= len(options):
+                    return idx - 1
+                print("that number's out of range (or q to quit)")
+        finally:
+            self._resume()
 
     def pick_many(self, title: str, rows: list[str]) -> list[int] | None:
         self._suspend()
-        print(f"\n== {title} ==")
-        for i, row in enumerate(rows, 1):
-            print(f" {i:>3}.  {row}")
-        while True:
-            try:
-                line = input("numbers separated by spaces | a = all | empty = cancel: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                self._resume()
-                return None
-            if line.lower() == "a":
-                self._resume()
-                return list(range(1, len(rows) + 1))
-            if not line:
-                self._resume()
-                return None
-            picks: list[int] = []
-            ok = True
-            for token in line.replace(",", " ").split():
+        try:
+            print(f"\n== {title} ==")
+            for i, row in enumerate(rows, 1):
+                print(f" {i:>3}.  {row}")
+            while True:
                 try:
-                    idx = int(token)
-                except ValueError:
-                    ok = False
-                    break
-                if not 1 <= idx <= len(rows):
-                    ok = False
-                    break
-                if idx not in picks:
-                    picks.append(idx)
-            if ok and picks:
-                self._resume()
-                return picks
-            print(f"s_numbers between 1 and {len(rows)}, or 'a', or empty to cancel")
+                    line = input(
+                        "numbers separated by spaces | a = all | empty = cancel: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return None
+                if line.lower() == "a":
+                    return list(range(1, len(rows) + 1))
+                if not line:
+                    return None
+                picks: list[int] = []
+                ok = True
+                for token in line.replace(",", " ").split():
+                    try:
+                        idx = int(token)
+                    except ValueError:
+                        ok = False
+                        break
+                    if not 1 <= idx <= len(rows):
+                        ok = False
+                        break
+                    if idx not in picks:
+                        picks.append(idx)
+                if ok and picks:
+                    return picks
+                print(f"give numbers between 1 and {len(rows)}, or 'a', or empty to cancel")
+        finally:
+            self._resume()
 
     def run_visible(self, fn):
         # nothing to suspend in plain mode; output just flows to the terminal
@@ -598,6 +859,20 @@ class CursesIO(PlainIO):
         self.std.clear()
         self.std.refresh()
 
+    def ask(self, prompt: str, default: str = "") -> str:
+        self._suspend()
+        try:
+            return super().ask(prompt, default)
+        finally:
+            self._resume()
+
+    def confirm(self, prompt: str, default: bool = False) -> bool:
+        self._suspend()
+        try:
+            return super().confirm(prompt, default)
+        finally:
+            self._resume()
+
     _attr_warned = False
 
     def menu(self, title: str, options: list[str], header=()):
@@ -637,7 +912,10 @@ class CursesIO(PlainIO):
                 put(row + j - start, 1, mark + options[j], attr)
             put(rows - 1, 1, "↑/↓ move · enter select · q quit", c.A_DIM)
             self.std.refresh()
-            key = self.std.getch()
+            try:
+                key = self.std.getch()
+            except KeyboardInterrupt:  # ctrl-c = cancel, same as q
+                return None
             if key in (c.KEY_UP, ord("k")):
                 sel = max(0, sel - 1)
             elif key in (c.KEY_DOWN, ord("j")):
@@ -670,18 +948,31 @@ def main(argv: list[str] | None = None) -> int:
         "titles": None,
         "titles_sd": None,
     }
+    if "--check" in argv:  # non-interactive self-check, sane exit codes
+        import doctor
+        return doctor.main(argv)
     if plain:
-        run_app(PlainIO(), ctx)
+        try:
+            run_app(PlainIO(), ctx)
+        except KeyboardInterrupt:
+            print()
+            return 130
         return 0
     try:
         import curses
         curses.wrapper(_curses_run, ctx)
         return 0
+    except KeyboardInterrupt:
+        print()
+        return 130
     except Exception as exc:  # broken terminal etc → fall back to plain menus
         if "--plain-strict" in argv:
             raise
         print(f"curses died ({exc!r}); falling back to plain menus", file=sys.stderr)
-        run_app(PlainIO(), ctx)
+        try:
+            run_app(PlainIO(), ctx)
+        except KeyboardInterrupt:
+            pass
         return 0
 
 

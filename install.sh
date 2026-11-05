@@ -58,28 +58,47 @@ sudo_run() {
 
 detect_pm() {
   PM="${PM_FORCE:-}"
-  if [ -z "$PM" ]; then
-    for p in apt-get dnf pacman zypper apk; do
+  if [ -n "$PM" ]; then
+    case " apt-get dnf pacman zypper apk xbps-install emerge nixos " in
+      *" $PM "*)
+        info "package manager forced via PM_FORCE: $PM"
+        return
+        ;;
+      *)
+        die "PM_FORCE='$PM' is not supported — known: apt-get dnf pacman zypper apk xbps-install emerge nixos"
+        ;;
+    esac
+  fi
+  if [ -f /etc/os-release ] && . /etc/os-release 2>/dev/null && [ "${ID:-}" = "nixos" ]; then
+    PM="nixos"
+  else
+    for p in apt-get dnf pacman zypper apk xbps-install emerge; do
       if have "$p"; then PM="$p"; break; fi
     done
   fi
-  [ -n "$PM" ] || die "no supported package manager found (apt/dnf/pacman/zypper/apk) —
+  [ -n "$PM" ] || die "no supported package manager found (apt/dnf/pacman/zypper/apk/xbps/emerge) —
 install by hand: python3 + venv/pip, gcc/make/pkg-config, curl, git, cargo, fuse dev headers"
   info "using package manager: $PM"
 }
 
 install_pkgs() {
   info "installing distro packages (sudo may prompt once)"
+  # note: if one package name is wrong on a distro, the whole transaction
+  # aborts — so the fallbacks below repeat the FULL list, swapping only the
+  # fuse package (libfuse3-dev/fuse3-devel have older aliases)
   case "$PM" in
     apt-get)
       sudo_run apt-get update -y
       sudo_run apt-get install -y python3 python3-venv python3-pip build-essential \
         pkg-config curl git cargo rustc libfuse3-dev \
-        || sudo_run apt-get install -y libfuse-dev
+        || sudo_run apt-get install -y python3 python3-venv python3-pip build-essential \
+          pkg-config curl git cargo rustc libfuse-dev
       ;;
     dnf)
       sudo_run dnf install -y python3 python3-pip gcc make pkgconf-pkg-config \
-        curl git cargo rustc fuse3-devel || sudo_run dnf install -y fuse-devel
+        curl git cargo rustc fuse3-devel \
+        || sudo_run dnf install -y python3 python3-pip gcc make pkgconf-pkg-config \
+          curl git cargo rustc fuse-devel
       ;;
     pacman)
       sudo_run pacman -Sy --needed --noconfirm python python-pip base-devel \
@@ -88,11 +107,25 @@ install_pkgs() {
     zypper)
       sudo_run zypper --non-interactive install python3 python3-pip gcc make \
         pkg-config curl git cargo rust fuse3-devel \
-        || sudo_run zypper --non-interactive install fuse-devel
+        || sudo_run zypper --non-interactive install python3 python3-pip gcc make \
+          pkg-config curl git cargo rust fuse-devel
       ;;
     apk)
       sudo_run apk add --no-cache python3 py3-pip build-base pkgconf fuse-dev \
         curl git cargo rust
+      ;;
+    xbps-install)
+      sudo_run xbps-install -Sy python3 python3-pip base-devel fuse-devel rust curl git
+      ;;
+    emerge)
+      sudo_run emerge --noreplace dev-lang/python dev-python/pip dev-vcs/git \
+        net-misc/curl dev-lang/rust sys-fs/fuse-common sys-fs/fuse || true
+      ;;
+    nixos)
+      warn "nixos gets manual hints instead of an install:"
+      warn "  nix profile install nixpkgs#curl nixpkgs#git nixpkgs#rustc nixpkgs#cargo"
+      warn "python3 is usually already present; rerun this script once those exist."
+      warn "(the rest of the toolkit uses zero systemd anywhere, so runit/s66/openrc etc. are fine)"
       ;;
   esac
 }
@@ -131,12 +164,23 @@ setup_save3ds() {
   fi
   info "building save3ds (takes a minute or two)"
   if run bash -c "cd '$SRC_DIR/save3ds' && cargo build --release"; then
-    run install -Dm755 "$SRC_DIR/save3ds/target/release/save3ds_fuse" "$BIN_DIR/save3ds_fuse"
+    run install -Dm755 "$SRC_DIR/save3ds/target/release/save3ds_fuse" "$BIN_DIR/save3ds_fuse" \
+      || warn "built ok but install failed — run it yourself: install -Dm755 \\
+      $SRC_DIR/save3ds/target/release/save3ds_fuse $BIN_DIR/save3ds_fuse"
+    return
+  fi
+  warn "full build failed (probably no fuse dev headers) — retrying without fuse mounting"
+  if run bash -c "cd '$SRC_DIR/save3ds' && cargo build --release -p save3ds_fuse --no-default-features" \
+     || run bash -c "cd '$SRC_DIR/save3ds/save3ds_fuse' && cargo build --release --no-default-features"; then
+    # the artifact lands in the workspace root target dir (member-dir builds
+    # can put it in the member's own target) — try both, don't die on failure
+    run install -Dm755 "$SRC_DIR/save3ds/target/release/save3ds_fuse" "$BIN_DIR/save3ds_fuse" \
+      || run install -Dm755 "$SRC_DIR/save3ds/save3ds_fuse/target/release/save3ds_fuse" \
+        "$BIN_DIR/save3ds_fuse" \
+      || warn "built ok but install failed — copy save3ds_fuse onto PATH yourself"
   else
-    warn "full build failed (probably no fuse dev headers) — retrying without fuse mounting"
-    run bash -c "cd '$SRC_DIR/save3ds/save3ds_fuse' && cargo build --release --no-default-features"
-    run install -Dm755 "$SRC_DIR/save3ds/save3ds_fuse/target/release/save3ds_fuse" \
-      "$BIN_DIR/save3ds_fuse"
+    warn "couldn't build save3ds without fuse either — the card listing in the tui needs it."
+    warn "build it by hand later: https://github.com/wwylele/save3ds#building"
   fi
 }
 
@@ -148,10 +192,10 @@ check_keys() {
   done
   [ "$found" = 1 ] || warn "  boot9.bin missing — dump it: $KEYS_GUIDE"
   found=0
-  for f in "$HOME/3ds/movable.sed"; do
+  for f in "$HOME/3ds/movable.sed" "$HOME/.3ds/movable.sed"; do
     if [ -f "$f" ]; then info "  movable: $(tilde2 "$f")"; found=1; break; fi
   done
-  [ "$found" = 1 ] || warn "  movable.sed missing from ~/3ds — dump it: $KEYS_GUIDE"
+  [ "$found" = 1 ] || warn "  movable.sed missing from ~/3ds or ~/.3ds — dump it: $KEYS_GUIDE"
 }
 
 tilde2() { printf '%s' "${1/#$HOME/~}"; }
@@ -165,6 +209,9 @@ main() {
   setup_toolchain
   setup_save3ds
   check_keys
+  info "running the setup self-check (scripts/doctor.py)"
+  run python3 "$REPO_DIR/scripts/tui.py" --check \
+    || warn "the check above found blockers — fix them for a smooth run"
   case ":$PATH:" in
     *":$BIN_DIR:"*) info "PATH ok" ;;
     *) warn "$BIN_DIR is not on PATH — add this to your shell rc: export PATH=\"$BIN_DIR:\$PATH\"" ;;
