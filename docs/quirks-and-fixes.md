@@ -14,11 +14,39 @@ them. sorted by which program they belong to.
 
   writing `-x DEST` instead makes save3ds complain with the wonderfully vague
   `Please specify one mount path` (the DEST eats a positional that isn't there).
+  the same shape applies to `-f/--format` and `-i/--import` (and to the
+  save-flavored `-f`, which also wants a positional even though it ignores it).
+
+- **import really is "clear everything, then re-import".** looked at the
+  source (v0.3+): `import()` calls `clear_impl()` on the whole archive before
+  walking your directory — that's why the uninstall flow works at all, and
+  why it makes a RAW copy of title.db/import.db first (the only way back if
+  an import is interrupted). entries are re-imported from the exported
+  16-hex-digit-named files; files with names that don't convert cleanly (say,
+  the stray `-0004000000033500` one) are skipped with `Name not valid` —
+  harmless.
 
 - **boot9 is required even when "only" reading an SD database.** without
   `-b boot9.bin`, the failure is `Cannot open SD due to missing SD or
   movable.sed` — which sends you down the completely wrong debugging path.
   always pass `-m` AND `-b` (custominstall itself does the same).
+
+- **`--format` doesn't work on database types.** the help suggests `-f`
+  generally; for `--db sdtitle` it just prints `Warning: formatting not
+  supported`. there is no pc-side way to create a fresh title.db — only the
+  console does that (SdPath... software management), which is fine.
+
+- **"Signature mismatch" on a db copy usually means the copy is stale.** the
+  db verifies an internal cmac derived from your movable; a snapshot taken
+  while a pc-side tool was mid-write into the databases does not match
+  anymore. nothing is wrong with the tool logic — export again from the live
+  card. the uninstall flow refuses to act unless the live export succeeds.
+
+- **the card's directory names are derived, not random:** `id0` is sha256
+  over the 16-byte seed at offset 0x110 of movable.sed, with each 4-byte
+  group byte-reversed (save3ds `hash_movable`; same result as pyctr's id0).
+  save3ds itself just takes the first directory under
+  `Nintendo 3DS/<id0>/`; custominstall warns when there are several <id1> dirs.
 
 - extraction dumps *system* titles too, not just your games. game entries
   stand out through the 128-byte title info entry (a product code like
@@ -27,6 +55,23 @@ them. sorted by which program they belong to.
 
 - a stray `-0004000000033500`-looking file can appear in extracted output;
   our scripts just skip non-16-hex names.
+
+## decryptor-tui / ctrdecrypt (vendored rust decryptor)
+
+- **originals are read-only.** the tui runs everything against copies inside
+  a `.ihaveacreditcard-decrypt/` work dir in the source folder, decrypts
+  there, and only then moves `*-decrypted.*` results out. inputs are touched
+  by nothing but their own file access.
+- **makerom mania:** v0.19 needs the three-field content spec for BOTH output
+  types: `-content PART:INDEX:ID` (index = partition index for cci, content
+  id for cia; the parser reads the last-but-one colon, so a two-field spec
+  silently mis-parses). `-help` exits 254 — never use its exit code as a
+  sanity check, look at the banner.
+- **decrypted/already-decrypted inputs are skipped, not re-done.** the probe
+  (ctrdecrypt lib, in-process) answers "is this encrypted?" without makerom;
+  only repacking calls out to makerom.
+- seed lookups: `--seeddb` wins, then cwd/`~/3ds`/`~/.3ds` fallbacks; with
+  `--no-online` it never goes to nintendo's servers for missing seeds.
 
 ## custom-install / custom-install-finalize (ihaveamac)
 

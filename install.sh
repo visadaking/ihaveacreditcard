@@ -2,14 +2,16 @@
 # ihaveacreditcard bootstrap — linux only (that's the point).
 #
 # does everything once for you: distro packages, the python venv with the
-# custom-install package, building save3ds and dropping the binaries on PATH,
-# plus a nudge about the keys you still have to dump yourself.
+# custom-install package, building save3ds, building the vendored decryptor
+# (decryptor-tui/ctrdecrypt + makerom/ctrtool) and dropping the binaries on
+# PATH, plus a nudge about the keys you still have to dump yourself.
 #
 # usage:
-#   ./install.sh            full setup, then offers to start the tui
-#   ./install.sh --dry-run  print what it would do, touch nothing
-#   ./install.sh --no-sudo  don't call sudo (you'll need packages installed already)
-#   ./install.sh --skip-tui don't offer the tui at the end
+#   ./install.sh              full setup, then offers to start the tui
+#   ./install.sh --dry-run    print what it would do, touch nothing
+#   ./install.sh --no-sudo    don't call sudo (you'll need packages installed already)
+#   ./install.sh --skip-tui   don't offer the tui at the end
+#   ./install.sh --no-decryptor  skip the decryptor/decryptor-tui/makerom builds
 # extras you can set: CC_SRC_DIR=/somewhere (where the save3ds source is cloned)
 
 set -euo pipefail
@@ -22,13 +24,14 @@ PART_URL="https://github.com/ihaveamac/custom-install/archive/refs/heads/python-
 SAVE3DS_URL="https://github.com/wwylele/save3ds.git"
 KEYS_GUIDE="https://wiki.hacks.guide/wiki/3DS:Dump_system_files"
 
-DRY_RUN=0 NO_SUDO=0 SKIP_TUI=0
+DRY_RUN=0 NO_SUDO=0 SKIP_TUI=0 NO_DECRYPTOR=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --no-sudo) NO_SUDO=1 ;;
     --skip-tui|--no-tui) SKIP_TUI=1 ;;
-    *) echo "unknown option: $arg (try --dry-run / --no-sudo / --skip-tui)" >&2; exit 2 ;;
+    --no-decryptor) NO_DECRYPTOR=1 ;;
+    *) echo "unknown option: $arg (try --dry-run / --no-sudo / --skip-tui / --no-decryptor)" >&2; exit 2 ;;
   esac
 done
 
@@ -198,6 +201,58 @@ check_keys() {
   [ "$found" = 1 ] || warn "  movable.sed missing from ~/3ds or ~/.3ds — dump it: $KEYS_GUIDE"
 }
 
+# ---------------------------------------------------------------- decryptor
+# the vendored rust decryptor (decryptor/README.md): ctrdecrypt = library +
+# cli, decryptor-tui = the batch decryptor UI. makerom/ctrtool come from
+# Project_CTR and are what decryptor-tui calls for the final repack step.
+# ---------------------------------------------------------------- decryptor
+# the vendored rust decryptor (decryptor/README.md): ctrdecrypt = library +
+# cli, decryptor-tui = the batch decryptor UI. makerom/ctrtool come from
+# Project_CTR and are what decryptor-tui calls for the final repack step.
+setup_decryptor() {
+  if [ -x "$HOME/.cargo/bin/decryptor-tui" ] || have decryptor-tui; then
+    info "decryptor-tui already available"
+    return
+  fi
+  if ! have cargo; then
+    warn "cargo not found → skipping the decryptor build."
+    warn "the decrypt flow in the tui needs decryptor-tui: install rust, then rerun."
+    return
+  fi
+  for crate in ctrdecrypt tui; do
+    if [ "$crate" = "ctrdecrypt" ]; then bin="ctrdecrypt"; else bin="decryptor-tui"; fi
+    info "building vendored decryptor/$crate (cargo release)"
+    if run bash -c "cd '$REPO_DIR/decryptor/$crate' && cargo build --release" \
+       && [ -x "$REPO_DIR/decryptor/$crate/target/release/$bin" ]; then
+      run install -Dm755 "$REPO_DIR/decryptor/$crate/target/release/$bin" "$BIN_DIR/$bin" \
+        || warn "built ok but install failed — copy $bin onto PATH yourself"
+    else
+      warn "couldn't build $crate — see decryptor/README.md for manual steps"
+    fi
+  done
+}
+
+setup_project_ctr() {
+  local tool=""
+  for tool in ctrtool makerom; do
+    if [ -x "$BIN_DIR/$tool" ] || have "$tool"; then
+      info "$tool already available"
+      continue
+    fi
+    if [ ! -d "$SRC_DIR/Project_CTR" ]; then
+      run git clone --depth 1 https://github.com/3DSGuy/Project_CTR "$SRC_DIR/Project_CTR" \
+        || { warn "couldn't clone Project_CTR — makerom build skipped"; return; }
+    fi
+    info "building $tool (native linux, replaces the windows .exe's)"
+    if run bash -c "cd '$SRC_DIR/Project_CTR/$tool' && make deps >/dev/null && make -j\"\$(nproc)\""; then
+      run install -Dm755 "$SRC_DIR/Project_CTR/$tool/bin/$tool" "$BIN_DIR/$tool" \
+        || warn "built ok but install failed — copy $tool onto PATH yourself"
+    else
+      warn "couldn't build $tool — decryptor's repack step needs makerom (ctrtool is optional)"
+    fi
+  done
+}
+
 tilde2() { printf '%s' "${1/#$HOME/~}"; }
 
 main() {
@@ -208,6 +263,10 @@ main() {
   check_python
   setup_toolchain
   setup_save3ds
+  if [ "$NO_DECRYPTOR" = 0 ]; then
+    setup_decryptor
+    setup_project_ctr
+  fi
   check_keys
   info "running the setup self-check (scripts/doctor.py)"
   run python3 "$REPO_DIR/scripts/tui.py" --check \

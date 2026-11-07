@@ -28,10 +28,12 @@ clone this repo and run:
 python3 scripts/tui.py
 ```
 
-it checks your keys, finds mounted sd card candidates, installs dumps and can
-write `cifinish.bin` for the finalize step — guided menus all the way, with a
-plain numbered-menu fallback (`--plain`) for weird terminals. `install.sh`
-bootstraps a fresh linux box (distro packages, save3ds build, venv).
+it checks your keys, finds mounted sd card candidates, installs dumps,
+**decrypts dumps pc-side**, lists what's on the card, **uninstalls titles**,
+and can write `cifinish.bin` for the finalize step — guided menus all the way,
+with a plain numbered-menu fallback (`--plain`) for weird terminals.
+`install.sh` bootstraps a fresh linux box (distro packages, save3ds build, the
+vendored decryptor, venv).
 
 ## setup
 
@@ -55,6 +57,23 @@ python3 -m venv ~/.venvs/custom-install
 
 build save3ds per its README and drop `save3ds_fuse` somewhere on PATH, e.g.
 `~/.local/bin/`. the installer finds boot9/seeddb in `~/3ds/` on its own.
+
+## decrypting a dump (pc-side, v0.2)
+
+`install.sh` builds the vendored [decryptor](decryptor/README.md)
+(`decryptor-tui`, `ctrdecrypt`) plus makerom/ctrtool. the tui's "decrypt dumps"
+menu point copies the picked dumps into a work dir, decrypts them and moves
+the results out — decrypting `.3ds` gives you `*-decrypted.cci` (plus
+`(Update)`/`(DLC)` variants when the dump has those partitions); decrypted
+dumps then install straight through the normal install flow. originals are
+only ever read.
+
+headless, without the tui:
+
+```
+decryptor-tui --headless /path/to/roms
+# or:  ctrdecrypt "Game (USA).3ds"
+```
 
 ## installing a dump
 
@@ -107,12 +126,25 @@ things to sanity check against your install log:
 - `.sav` file sizes match the tmd save size
 - the db entry is there, with the content ids / flags you expect
 
-## removing a title
+## removing a title (pc-side, v0.2)
 
-not from the pc. `dbs/title.db` on the card is wrapped in per-console sd
-crypto + cmac, there is no plain database file to edit. FBI on the console
-does it: Titles → (title) → Delete. if a ticket lingers after deleting the
-contents some other way, FBI → Tickets handles the leftovers.
+the old rule was "not from the pc" — that changed in v0.2. the tui's
+"uninstall title(s) from the card" flow now does what FBI's Titles → Delete
+does, without the console round-trip:
+
+1. it snapshots `dbs/title.db` + `import.db` (raw) and the `.sav` files into
+   `~/Documents/ihaveacreditcard-backups/` first
+2. exports every title.db entry via `save3ds_fuse --db sdtitle -x` (read-only)
+3. rewrites the db without the picked entries (save3ds `import` = clear the
+   whole archive, then re-import) and deletes the title content dirs
+4. verifies by re-exporting
+
+tickets are not touched (they live on the console's NAND) — if FBI's Tickets
+menu still lists one, delete it there. see
+[docs/quirks-and-fixes.md](docs/quirks-and-fixes.md) for why this works and
+what to check before trusting it.
+
+on the console, FBI (Titles → Delete) still works exactly as before.
 
 ## seeds
 
@@ -128,14 +160,16 @@ db realities) plus the fixes this repo routes around them are written up in
 ## scripts
 
 - `scripts/tui.py` — the guided ui: checks keys, finds mounted sd cards,
-  installs dumps, lists titles on the card and writes `cifinish.bin`
+  installs dumps, **decrypts dumps pc-side (with the vendored decryptor)**,
+  lists titles on the card, **uninstalls titles**, and writes `cifinish.bin`
   (`--plain` for a numbered menu on dumb terminals / over ssh). on every
   launch it auto-snapshots the card's dbs + `cifinish.bin` into
   `~/Documents/ihaveacreditcard-backups/`, copies the `.sav` files before any
   run that would overwrite saves, and keeps the newest 30 snapshots
 - `scripts/doctor.py` — the self-check on its own: python version, key files
-  verified by magic bytes + size (not just existence), that save3ds_fuse and
-  custominstall actually execute, and that the card is mounted writable.
+  verified by magic bytes + size (not just existence), that save3ds_fuse,
+  custominstall, **decryptor-tui and makerom** actually execute, and that the
+  card is mounted writable.
   `--strict` turns warnings into failures for scripting; the tui's menu has
   the same check, and `python3 scripts/tui.py --check` runs it non-interactively
 - `scripts/make_cifinish.py` — non-interactive way to write a fresh
@@ -143,11 +177,16 @@ db realities) plus the fixes this repo routes around them are written up in
 - `scripts/inspect_title_db.py` — decodes the 128-byte title entries save3ds
   extracts from the card's title.db (each extracted file is one entry, named
   after the title id)
+- `decryptor/` — the vendored decryptor (rust): `ctrdecrypt` in-process
+  decrypt/probe library + CLI, `decryptor-tui` batch decryptor with a proper
+  ratatui interface and a headless mode. license + build notes in
+  [decryptor/README.md](decryptor/README.md)
 - `install.sh` — one-shot bootstrap for a fresh linux box: distro packages
   (apt/dnf/pacman/zypper/apk — which also covers non-systemd distros like void
   or artix — plus xbps/emerge, and manual hints on nixos), save3ds build,
-  python venv with custom-install (`--dry-run` to preview). zero systemd is
-  used anywhere in the toolkit.
+  **vendored decryptor + makerom/ctrtool builds**, python venv with
+  custom-install (`--dry-run` to preview, `--no-decryptor` to skip the rust
+  part). zero systemd is used anywhere in the toolkit.
 
 ## cifinish.bin (v3) format
 

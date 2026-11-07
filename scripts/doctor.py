@@ -104,6 +104,30 @@ def check_seeddb(path: str | None) -> tuple[str, str]:
     return "ok", f"seeddb: {tui.tilde(path)} ({count} entries)"
 
 
+def check_makerom(path: str | None) -> tuple[str, str]:
+    """makerom is quirky: -help exits with 254 — so check its banner, not the
+    exit code, and otherwise treat it like the other tools."""
+    ok_codes = (0, 1, 2, 252, 254)
+    if not path:
+        return "warn", ("makerom not found — decryptor-tui needs it for the final "
+                        "repack step (./install.sh builds it)")
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        return "fail", f"makerom is at {tui.tilde(path)} but isn't executable"
+    try:
+        proc = subprocess.run([path, "-help"], capture_output=True, text=True,
+                              timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return "fail", f"makerom is on disk but won't run ({err})"
+    banner = (proc.stdout or "") + (proc.stderr or "")
+    if "MAKEROM" not in banner.upper():
+        return "fail", (f"makerom runs but --help exited {proc.returncode} without "
+                        "a version banner — broken install?")
+    if proc.returncode not in ok_codes:
+        return "fail", f"makerom exited {proc.returncode} — unexpected, broken install?"
+    line = banner.strip().splitlines()[0] if banner.strip() else ""
+    return "ok", f"makerom: {tui.tilde(path)} ({line[:48]})"
+
+
 def check_tool(path: str | None, name: str, why: str) -> tuple[str, str]:
     if not path:
         return "warn", f"{name} not found — {why}"
@@ -141,6 +165,10 @@ def collect() -> tuple[list[tuple[str, str]], int, int]:
         check_tool(tui.find_tool("custominstall",
                                  ("~/.venvs/custom-install/bin/custominstall",)),
                    "custominstall", "the installer (ihaveamac python-package)"),
+        check_tool(tui.find_tool("decryptor-tui", ("~/.cargo/bin/decryptor-tui",)),
+                   "decryptor-tui", "pc-side batch decryption (vendored in "
+                   "decryptor/ — ./install.sh builds it)"),
+        check_makerom(tui.find_tool("makerom", ("~/.cargo/bin/makerom",))),
     ]
 
     if shutil.which("save3ds_fuse") is None and \

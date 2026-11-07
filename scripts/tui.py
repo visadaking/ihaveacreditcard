@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""tui for the toolkit: check the setup, install dumps, list card titles, write cifinish.bin.
+"""tui for the toolkit: check the setup, install dumps, decrypt dumps, list card
+titles, uninstall titles, write cifinish.bin.
 
 run from inside the repo:
 
     python3 scripts/tui.py
 
 it drives the exact same tools documented in the README (the custominstall
-binary, save3ds_fuse, boot9/movable keys) — no crypto is reimplemented here.
+binary, save3ds_fuse, the vendored decryptor-tui, boot9/movable keys) — no
+crypto is reimplemented here.
 
 if the terminal can't do full-screen rendering (or you pass --plain), it falls
 back to a plain numbered menu that offers the exact same functions.
@@ -15,6 +17,7 @@ back to a plain numbered menu that offers the exact same functions.
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 import shutil
 import subprocess
@@ -30,7 +33,7 @@ if os.fspath(HERE) not in sys.path:
 from inspect_title_db import decode_entry, entry_lines          # noqa: E402
 from make_cifinish import build as build_cifinish               # noqa: E402
 
-APP_TITLE = "ihaveacreditcard · 3ds sd install toolkit (v0.1)"
+APP_TITLE = "ihaveacreditcard · 3ds sd install toolkit (v0.2)"
 KEY_DIRS = ("~/3ds", "~/.3ds")
 SD_MOUNT_PREFIXES = ("/run/media/", "/media/")
 FAT_TYPES = {"vfat", "exfat", "msdos", "fat", "ufsd", "tf_fat"}
@@ -58,6 +61,9 @@ CONSOLE_STEPS = [
 
 SAVE3DS_HINT = ("save3ds: build https://github.com/wwylele/save3ds and put "
                 "save3ds_fuse on PATH (see its README)")
+
+DECRYPTOR_HINT = ("decryptor: `./install.sh` builds the vendored decryptor "
+                  "(decryptor/README.md) and puts decryptor-tui on PATH")
 
 
 # --------------------------------------------------------------------------- #
@@ -111,6 +117,8 @@ def probe(ctx: dict) -> dict:
                                (os.environ.get("CUSTOM_INSTALL_SAVE3DS_PATH", ""),))
     ctx["installer"] = find_tool("custominstall",
                                  ("~/.venvs/custom-install/bin/custominstall",))
+    ctx["decryptor"] = find_tool("decryptor-tui",
+                                 ("~/.cargo/bin/decryptor-tui",))
     return ctx
 
 
@@ -297,6 +305,35 @@ def backup_saves(ctx: dict) -> str:
     return dest
 
 
+def backup_dbs(ctx: dict) -> str:
+    """raw copy of the card's database files before the uninstall flow rewrites
+    them. why so dramatic: save3ds import() clears the whole archive first, so
+    if anything goes wrong mid-import the only way back is the raw file."""
+    sd = ctx.get("sd")
+    if not sd:
+        return ""
+    base = ctx.get("backup_root") or card_backup_root()
+    if not base:
+        return ""
+    dest = os.path.join(base, time.strftime("%Y%m%d-%H%M%S") + "-dbs-pre-uninstall")
+    copied = []
+    for pattern, name in CARD_DB_PATTERNS:
+        for i, src in enumerate(glob.glob(os.path.join(sd, pattern))):
+            if _copy_within(src, dest, name if i == 0 else f"{i}-{name}"):
+                copied.append(name)
+    if not copied:
+        return ""
+    try:
+        with open(os.path.join(dest, "restore.txt"), "w", encoding="utf-8") as f:
+            f.write("taken before an uninstall run changed title.db\n"
+                    "roll back by copying the db files back to\n"
+                    "Nintendo 3DS/<id0>/<id1>/dbs/ on the card (nothing else needed).\n")
+    except OSError:
+        pass
+    prune_backups(base)
+    return dest
+
+
 def write_inventory(ctx: dict, entries: list[dict]) -> None:
     """drop the titles table in the backup dir as a timestamped text file."""
     base = ctx.get("backup_root") or card_backup_root()
@@ -319,6 +356,7 @@ def status_header(ctx: dict) -> list[str]:
         f"seeddb     : {fmt(ctx['seeddb'])}",
         f"save3ds    : {fmt(ctx['save3ds'])}",
         f"installer  : {fmt(ctx['installer'])}",
+        f"decryptor  : {fmt(ctx['decryptor'])}",
         f"sd card    : {fmt(ctx['sd'])}",
         f"backups    : {tilde(bdir) if bdir else 'off'}",
     ]
@@ -387,14 +425,47 @@ def cache_titles(ui, ctx: dict) -> list[dict]:
     return entries
 
 
+def sd_id0(movable_path: str) -> str | None:
+    """the id0 directory name the console derives from movable.sed.
+
+    same derivation as save3ds' hash_movable (verified against pyctr): sha256
+    over the 16-byte seed at offset 0x110 of the movable, then the four 4-byte
+    groups of the digest reversed."""
+    try:
+        with open(movable_path, "rb") as f:
+            f.seek(0x110)
+            seed = f.read(16)
+    except OSError:
+        return None
+    if len(seed) != 16:
+        return None
+    digest = hashlib.sha256(seed).digest()
+    return bytes(digest[3::-1] + digest[7:3:-1]
+                 + digest[11:7:-1] + digest[15:11:-1]).hex()
+
+
+def card_content_dirs(ctx: dict) -> list[str]:
+    """Nintendo 3DS/<id0>/<id1>/ dirs on the chosen card (id0 derived from the
+    movable exactly like the console and save3ds do; <id1> dir taken as-is)."""
+    movable = ctx.get("movable")
+    sd = ctx.get("sd")
+    if not movable or not sd:
+        return []
+    id0 = sd_id0(movable)
+    if not id0:
+        return []
+    return [d for d in sorted(glob.glob(os.path.join(sd, "Nintendo 3DS", id0, "*")))
+            if os.path.isdir(d)]
+
+
 # --------------------------------------------------------------------------- #
 # flows (shared by both ui modes)
 # --------------------------------------------------------------------------- #
 
-def gateway(ctx: dict, need=(), ui=None) -> str | None:
-    """make sure sd + required tools exist. returns error text or None."""
+def gateway(ctx: dict, need=(), sd: bool = True, ui=None) -> str | None:
+    """make sure sd (unless opted out) + required tools exist → error text or None."""
     problems = []
-    if ctx["sd"] is None:
+    if sd and ctx["sd"] is None:
         problems.append("no sd card picked — pick one from the main menu")
     for key in need:
         if not ctx.get(key):
@@ -402,6 +473,8 @@ def gateway(ctx: dict, need=(), ui=None) -> str | None:
     for key in need:
         if key == "save3ds" and not ctx.get("save3ds"):
             problems.append(SAVE3DS_HINT)
+        if key == "decryptor" and not ctx.get("decryptor"):
+            problems.append(DECRYPTOR_HINT)
     if problems:
         ui.page("missing pieces", problems)
         return None
@@ -437,10 +510,13 @@ def pick_sd(ui, ctx: dict) -> None:
     ]
     rows.append("type a path manually")
     print("\nsd card candidates:")
-    picks = ui.pick_many("sd card candidates", rows)
+    picks = ui.pick_many("sd card candidates", rows) or []
     if not picks:
         return
-    if picks == [len(rows)]:
+    # the manual row can be picked together with mount rows — manual wins
+    # (v0.1 only handled an exact picks == [len(rows)], so picks like
+    # [2, 4] silently dropped the manual intent)
+    if len(rows) in picks:
         manual = ui.ask("sd card mount point: ", "")
         path = os.path.expandvars(os.path.expanduser(manual))
         if os.path.isdir(path):
@@ -525,6 +601,212 @@ def flow_install(ui, ctx: dict) -> None:
         if saves_backup:
             lines.append(f"note: existing saves were backed up to {tilde(saves_backup)}")
     ui.page("install result", lines)
+
+
+def flow_decrypt(ui, ctx: dict) -> None:
+    """batch-decrypt dumps on the pc (no sd card involvement). originals are
+    only ever read: everything runs on copies inside a work dir, and the
+    decrypted files are moved back out when it succeeds."""
+    if gateway(ctx, need=("decryptor",), sd=False, ui=ui) is None:
+        return
+    dir_ = pick_dump_dir(ui)
+    dumps = scan_dumps(dir_)
+    if not dumps:
+        ui.page("nothing to decrypt", [
+            f"no .3ds/.3dz/.cia files in {dir_}",
+            f"the extensions looked for are: {', '.join(DUMP_EXTS)}",
+        ])
+        return
+    picks = ui.pick_many("pick dump(s) to decrypt (" + tilde(dir_) + ")",
+                         [tilde(d) for d in dumps])
+    if not picks:
+        return
+    chosen = [dumps[i - 1] for i in picks]
+    work = os.path.join(dir_, ".ihaveacreditcard-decrypt")
+    try:
+        os.makedirs(work, exist_ok=True)
+        for src in chosen:
+            print(f"copying {tilde(src)} "
+                  f"(≈{os.path.getsize(src) / (1024 ** 3):.1f} GiB) — original untouched")
+            shutil.copy2(src, os.path.join(work, os.path.basename(src)))
+        cmd = [ctx["decryptor"], "--headless"]
+        if ctx["seeddb"]:
+            cmd += ["--seeddb", ctx["seeddb"]]
+        cmd.append(work)
+        ui.page("decrypting...", [
+            " ".join(shlex_quote(a) for a in cmd),
+            "the tool's own progress output streams below.",
+        ])
+        rc = ui.run_visible(lambda: subprocess.run(cmd).returncode)
+    except KeyboardInterrupt:
+        ui.page("decrypt interrupted", [
+            f"processed files are left in {work}",
+            "nothing was removed — delete the dir by hand if you want it gone.",
+        ])
+        return
+    except OSError as exc:
+        ui.page("couldn't prepare the work dir", [str(exc)])
+        return
+    moved: list[str] = []
+    for out in sorted(glob.glob(os.path.join(work, "*-decrypted.c*"))):
+        try:
+            os.replace(out, os.path.join(dir_, os.path.basename(out)))
+            moved.append(os.path.basename(out))
+        except OSError:
+            pass
+    lines = [f"decryptor-tui exited with status {rc}."]
+    if moved:
+        lines.append("decrypted files, ready for the install flow:")
+        lines += [f"  {m}" for m in moved]
+    else:
+        lines.append("no *-decrypted.* outputs were produced.")
+    if os.path.isdir(work):
+        lines += ["", f"work dir left in place: {tilde(work)} (safe to delete)"]
+    ui.page("decrypt result", lines)
+
+
+def save3ds_cmd(ctx: dict, mode: str, directory: str) -> list[str]:
+    """the argument shape documented in docs/quirks-and-fixes.md: -x/-i are
+    plain flags and the directory is the one positional argument."""
+    return [ctx["save3ds"], "--db", "sdtitle", mode,
+            "--sd", ctx["sd"], "-m", ctx["movable"], "-b", ctx["boot9"], directory]
+
+
+def flow_uninstall(ui, ctx: dict) -> None:
+    """remove title(s) from the card pc-side: prune title.db entries through
+    save3ds export/import (import clears the archive and rewrites it without
+    the picked ones) and delete the title content dirs. dbs + saves are
+    backed up first; untouched until the export has fully succeeded."""
+    if gateway(ctx, need=("save3ds", "movable", "boot9"), ui=ui) is None:
+        return
+    entries = cache_titles(ui, ctx)
+    if not entries:
+        ui.page("nothing to uninstall", titles_table(entries))
+        return
+    ui.page("about uninstalling", [
+        "removes titles from the card's title.db pc-side and deletes their",
+        "content + save data — the pc equivalent of FBI's Titles → Delete.",
+        "",
+        "what actually happens:",
+        " 1. copy dbs + saves + cifinish into the backup folder",
+        " 2. export every title.db entry to a temp dir (read-only step)",
+        " 3. import() clears the whole archive, then rewrites it without the",
+        "    picked entries (save3ds drops their files first)",
+        " 4. delete the picked titles' content dirs on the card",
+        " 5. verify by re-exporting and counting",
+        "",
+        "tickets are NOT touched (they live on the console's NAND) — if FBI's",
+        "Tickets menu still lists one, delete it there. safe rollback: the",
+        "uninstall writes a raw dbs backup first (restore instructions included).",
+    ])
+    picks = ui.pick_many("pick title(s) to uninstall",
+                         titles_table(entries)[1:])  # titles_table has a header row
+    if not picks:
+        return
+    picked = [entries[i - 1] for i in picks]
+    names = [e["code_text"] or e["tid"] for e in picked]
+    dbs_backup = backup_dbs(ctx)
+    if not dbs_backup:
+        ui.page("refusing to run without the backup", [
+            "couldn't copy title.db/import.db into the backup folder —",
+            "fix IHC_BACKUP_DIR or the documents folder and try again.",
+        ])
+        return
+    saves_backup = backup_saves(ctx)
+    if not ui.confirm(
+            f"really uninstall {len(picked)} title(s)? ({', '.join(names)})",
+            default=False):
+        ui.page("aborted — nothing was touched", [
+            f"the dbs backup is still in {tilde(dbs_backup)} (harmless leftover)"])
+        return
+    tmp = tempfile.mkdtemp(prefix="ihaveacreditcard-uninstall-")
+    kept_dir = os.path.join(tmp, "kept")
+    removed_dir = os.path.join(tmp, "removed")
+    verify_dir = os.path.join(tmp, "verify")
+    os.makedirs(kept_dir)
+    os.makedirs(removed_dir)
+    os.makedirs(verify_dir)
+    keep_tmp = False
+    try:
+        proc = subprocess.run(save3ds_cmd(ctx, "-x", kept_dir),
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "unknown failure").strip()
+            ui.page("export failed — nothing was touched", [
+                tail.splitlines()[-1] if tail else "unknown failure",
+                "",
+                "a signature mismatch here means the card's dbs are in an",
+                "inconsistent state (mid-write earlier?): reboot the console",
+                "once with the card in, then run this again.",
+            ])
+            return
+        missing: list[str] = []
+        for tid in [e["tid"] for e in picked]:
+            entry_file = os.path.join(kept_dir, tid)
+            if os.path.isfile(entry_file):
+                os.replace(entry_file, os.path.join(removed_dir, tid))
+            else:
+                missing.append(tid)
+        if missing == [e["tid"] for e in picked]:
+            ui.page("nothing matched", [
+                "none of the picked titles were found in the exported entries",
+                "(weird — they were just listed). nothing was changed.",
+            ])
+            return
+        proc = subprocess.run(save3ds_cmd(ctx, "-i", kept_dir),
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            keep_tmp = True
+            tail = (proc.stderr or proc.stdout or "unknown failure").strip()
+            ui.page("the db rewrite FAILED", [
+                tail.splitlines()[-1] if tail else "unknown failure",
+                "",
+                "the card's dbs may now be incomplete or broken. restore:",
+                f"  1. copy title.db (and import.db) from {tilde(dbs_backup)}",
+                "     onto the card: Nintendo 3DS/<id0>/<id1>/dbs/",
+                f"  2. the pruned export is kept at {tmp}/kept",
+            ])
+            return
+        deleted = []
+        for tid in [e["tid"] for e in picked]:
+            for base in card_content_dirs(ctx):
+                victim = os.path.join(base, "title", tid[:8], tid[8:])
+                if os.path.isdir(victim):
+                    shutil.rmtree(victim, ignore_errors=True)
+                    deleted.append(victim)
+        proc = subprocess.run(save3ds_cmd(ctx, "-x", verify_dir),
+                              capture_output=True, text=True)
+        survivors = [e["tid"] for e in picked
+                     if os.path.isfile(os.path.join(verify_dir, e["tid"]))]
+        total = len([n for n in os.listdir(verify_dir)
+                     if len(n) == 16 and all(c in "0123456789abcdefABCDEF" for c in n)]) \
+            if proc.returncode == 0 else -1
+        ctx["titles"] = None  # the card listing changed → refresh on next read
+        ctx["titles_sd"] = None
+        lines = [
+            f"removed {len(picked) - len(survivors)}/{len(picked)} title(s) from title.db"
+            + (f" (verify failed: {proc.returncode})" if proc.returncode else ""),
+            f"title.db now lists {total} entr{'y' if total == 1 else 'ies'}"
+            if total >= 0 else "verify re-export failed — check things over in the card list flow",
+            f"content dirs deleted: {len(deleted)}"
+            + ("" if len(deleted) == len(picked) else " — some titles had none (system entries?)"),
+            "",
+            f"dbs backup (rollback): {tilde(dbs_backup)}",
+        ]
+        if saves_backup:
+            lines.append(f"save data snapshot: {tilde(saves_backup)}")
+        if survivors:
+            lines += ["", "these are STILL in the db (import didn't take them out):"]
+            lines += [f"  {t}" for t in survivors]
+        lines += ["",
+                  "open the HOME menu again (or reboot the console) to see the change;"
+                  " leftover tickets can only be deleted on console via FBI → Tickets."]
+        ui.page("uninstall done", lines)
+    finally:
+        if keep_tmp:
+            ui.page("note", [f"debug files kept: {tmp}"])
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def shlex_quote(text: str) -> str:
@@ -626,8 +908,8 @@ def flow_toolchain(ui, ctx: dict) -> None:
             rc = subprocess.run([pip, "install", "--upgrade", PACKAGE_URL]).returncode
         return rc
     if not ui.confirm(
-        "create the venv + pip install custom-install now? (needs internet) — "
-        f"python is {sys.executable}", default=True):
+        "create/upgrade the venv + pip install custom-install now? "
+        f"(needs internet) — python is {sys.executable}", default=True):
         ui.page("skipped", ["you can do it manually, see the readme's setup section"])
         return
     rc = ui.run_visible(_do)
@@ -647,7 +929,9 @@ def flow_check(ui, ctx: dict) -> None:
 
 FLOWS = {
     "install": flow_install,
+    "decrypt": flow_decrypt,
     "list": flow_list,
+    "uninstall": flow_uninstall,
     "cifinish": flow_cifinish,
     "inspect": flow_inspect,
     "toolchain": flow_toolchain,
@@ -658,7 +942,9 @@ FLOWS = {
 def main_options(_ctx: dict) -> list[tuple[str, str]]:
     return [
         ("install game dump(s) onto the sd card", "install"),
+        ("decrypt dump(s) on the pc (no sd card needed)", "decrypt"),
         ("list titles installed on the card", "list"),
+        ("uninstall title(s) from the card", "uninstall"),
         ("build cifinish.bin (re-finalize helper)", "cifinish"),
         ("inspect a title entry (pc-side check)", "inspect"),
         ("install the python toolchain (venv + pip)", "toolchain"),
@@ -707,7 +993,7 @@ def run_app(ui, ctx: dict) -> None:
 # --------------------------------------------------------------------------- #
 
 class PlainIO:
-    """plain-text terminal io вариант, works on pipes + dumb terminals."""
+    """plain-text terminal io variant, works on pipes + dumb terminals."""
 
     def _suspend(self) -> None:  # no-op for the plain backend
         pass
@@ -843,8 +1129,13 @@ class CursesIO(PlainIO):
         try:
             c.start_color()
             c.use_default_colors()
+            # 1 green (ok lines), 2 cyan (titles), 3 red (failures),
+            # 4 yellow (warnings), 5 magenta (echo/notes)
             c.init_pair(1, c.COLOR_GREEN, -1)
             c.init_pair(2, c.COLOR_CYAN, -1)
+            c.init_pair(3, c.COLOR_RED, -1)
+            c.init_pair(4, c.COLOR_YELLOW, -1)
+            c.init_pair(5, c.COLOR_MAGENTA, -1)
         except c.error:
             pass
         self.std.keypad(True)
@@ -873,7 +1164,146 @@ class CursesIO(PlainIO):
         finally:
             self._resume()
 
-    _attr_warned = False
+    def _size(self) -> tuple[int, int]:
+        try:
+            return self.std.getmaxyx()
+        except self._curses.error:
+            return 24, 80
+
+    def page(self, title: str, lines) -> None:
+        """full-screen scrollable page view (falls back to the plain dialog
+        only when the terminal is too cramped for real 8×30 + rows)."""
+        c = self._curses
+        lines = [str(line) for line in lines] or ["(nothing to show)"]
+        rows, cols = self._size()
+        if rows < 8 or cols < 30:
+            self._suspend()
+            try:
+                super().page(title, lines)
+            finally:
+                self._resume()
+            return
+        scroll = 0
+        while True:
+            rows, cols = self._size()
+            self.std.erase()
+
+            def put(r: int, cc: int, text: str, attr=c.A_NORMAL) -> None:
+                if 0 <= r < rows and 0 <= cc < cols:
+                    self.std.addnstr(r, cc, text, max(0, cols - cc), attr)
+
+            tattr = c.A_BOLD | (c.color_pair(2) if self._colors else 0)
+            put(0, 1, title, tattr)
+            put(1, 1, "↑/↓, pgup/pgdn, home/end scroll — any other key = back", c.A_DIM)
+            view_h = max(1, rows - 4)
+            max_scroll = max(0, len(lines) - view_h)
+            scroll = max(0, min(scroll, max_scroll))
+            for i, line in enumerate(lines[scroll:scroll + view_h]):
+                attr = c.A_NORMAL
+                if self._colors:
+                    if "FAIL" in line:
+                        attr = c.color_pair(3) | c.A_BOLD
+                    elif "MISSING" in line:
+                        attr = c.color_pair(4)
+                    elif line.startswith("ok "):
+                        attr = c.color_pair(1) | c.A_BOLD
+                    elif line.startswith("warn "):
+                        attr = c.color_pair(4) | c.A_BOLD
+                    elif line.startswith("== ") or line.startswith("-- "):
+                        attr = c.color_pair(5) | c.A_BOLD
+                put(2 + i, 1, line, attr)
+            if max_scroll > 0:
+                window = (f"{scroll + 1}-{min(scroll + view_h, len(lines))}"
+                          f"/{len(lines)}")
+                put(rows - 1, 1, window + ("  (more below)" if scroll < max_scroll else ""),
+                    c.A_DIM)
+            self.std.refresh()
+            try:
+                key = self.std.getch()
+            except KeyboardInterrupt:
+                return
+            if key in (c.KEY_UP, ord("k")):
+                scroll -= 1
+            elif key in (c.KEY_DOWN, ord("j")):
+                scroll += 1
+            elif key in (c.KEY_PPAGE,):
+                scroll -= view_h
+            elif key in (c.KEY_NPAGE,):
+                scroll += view_h
+            elif key == c.KEY_HOME:
+                scroll = 0
+            elif key == c.KEY_END:
+                scroll = max_scroll
+            else:
+                return
+
+    def pick_many(self, title: str, rows: list[str]) -> list[int] | None:
+        """full-screen checkbox picker: space toggles, a toggles all/none,
+        enter confirms. returns 1-based indices (plain-fallback contract)."""
+        c = self._curses
+        rows, cols = self._size()
+        if rows < 8 or cols < 30:
+            self._suspend()
+            try:
+                return super().pick_many(title, rows)
+            finally:
+                self._resume()
+        checked: set[int] = set()  # 0-based row indexes
+        sel = 0
+        while True:
+            rows, cols = self._size()
+            self.std.erase()
+
+            def put(r: int, cc: int, text: str, attr=c.A_NORMAL) -> None:
+                if 0 <= r < rows and 0 <= cc < cols:
+                    self.std.addnstr(r, cc, text, max(0, cols - cc), attr)
+
+            tattr = c.A_BOLD | (c.color_pair(2) if self._colors else 0)
+            put(0, 1, title, tattr)
+            put(1, 1, "space toggle · a all/none · enter done · anything else = cancel", c.A_DIM)
+            list_top = 2
+            list_h = max(1, rows - list_top - 2)
+            start = max(0, min(sel - list_h // 2, len(rows) - list_h))
+            for j in range(len(rows)):
+                if j - start >= list_h:
+                    put(rows - 2, 1, "… (more lines)", c.A_DIM)
+                    break
+                box = "[x]" if j in checked else "[ ]"
+                attr = (c.A_BOLD if j in checked else c.A_NORMAL)
+                if self._colors and j in checked:
+                    attr |= c.color_pair(1)
+                if j == sel:
+                    attr |= c.A_REVERSE
+                put(list_top + j - start, 1, f"{box} {rows[j]}", attr)
+            put(rows - 1, 1, f"{len(checked)}/{len(rows)} selected — enter = go", c.A_DIM)
+            self.std.refresh()
+            try:
+                key = self.std.getch()
+            except KeyboardInterrupt:
+                return None
+            if key in (c.KEY_UP, ord("k")):
+                sel = max(0, sel - 1)
+            elif key in (c.KEY_DOWN, ord("j")):
+                sel = min(len(rows) - 1, sel + 1)
+            elif key in (c.KEY_PPAGE,):
+                sel = max(0, sel - list_h)
+            elif key in (c.KEY_NPAGE,):
+                sel = min(len(rows) - 1, sel + list_h)
+            elif key == c.KEY_HOME:
+                sel = 0
+            elif key == c.KEY_END:
+                sel = len(rows) - 1
+            elif key == 32:  # space
+                checked.symmetric_difference_update({sel})
+            elif key == ord("a"):
+                if len(checked) == len(rows):
+                    checked.clear()
+                else:
+                    checked = set(range(len(rows)))
+            elif key in (c.KEY_ENTER, 10, 13, c.KEY_RIGHT):
+                return sorted(i + 1 for i in checked) or None
+            else:  # q/esc/unknown → same contract as the plain fallback: cancel
+                return None
 
     def menu(self, title: str, options: list[str], header=()):
         c = self._curses
